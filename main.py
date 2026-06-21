@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import yfinance as yf
+import requests as req
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -100,3 +102,114 @@ def predict_price(request: PriceRequest):
         "predicted_scaled_price": float(prediction[0][0]),
         "note": "Bu değer 0-1 arası normalize edilmiş fiyattır."
     }
+
+@app.get("/predict/price/live")
+def predict_live_price():
+    try:
+        btc = yf.download("BTC-USD", period="7d", interval="1h")
+        
+        df_60 = btc[['Close', 'High', 'Low', 'Volume']].tail(60)
+        
+        input_data = df_60.values
+        
+        min_vals = input_data.min(axis=0)
+        max_vals = input_data.max(axis=0)
+        
+        scaled_data = (input_data - min_vals) / (max_vals - min_vals + 1e-8)
+        
+
+        input_reshaped = scaled_data.reshape(1, 60, 4)
+        
+        prediction = price_model.predict(input_reshaped)
+        predicted_scaled = float(prediction[0][0])
+        
+        predicted_real_price = predicted_scaled * (max_vals[0] - min_vals[0]) + min_vals[0]
+        
+        current_price = float(df_60['Close'].iloc[-1])
+
+        return {
+            "status": "success",
+            "current_price": current_price,
+            "predicted_price": predicted_real_price,
+            "note": "Veriler anlık olarak Yahoo Finance üzerinden çekilmiştir."
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    
+@app.get("/predict/sentiment/live")
+def predict_live_sentiment():
+    try:
+        import re
+        
+        url = "https://api.rss2json.com/v1/api.json?rss_url=https://cointelegraph.com/rss"
+        
+        raw_response = req.get(url, timeout=10)
+        api_response = raw_response.json()
+
+        if api_response.get("status") != "ok":
+            return {"status": "error", "message": "Haber kaynağına ulaşılamadı. Daha sonra tekrar deneyin."}
+
+        items = api_response.get("items", [])
+        news_list = items[:5]
+        
+        if not news_list:
+            return {"status": "error", "message": "Sitede şu an gösterilecek haber bulunamadı."}
+
+        analyzed_news = []
+        sentiment_scores = [] 
+        confidence_sum = 0.0
+        
+        for article in news_list:
+            title = article.get('title', '')
+            body_html = article.get('description', '')
+            
+            body = re.sub(r'<[^>]+>', ' ', body_html)
+            
+            full_text = f"{title}. {body}"
+
+            cleaned = clean_text(full_text)
+            seq = tokenizer.texts_to_sequences([cleaned])
+            padded = tf.keras.preprocessing.sequence.pad_sequences(seq, maxlen=100, padding='post', truncating='post')
+            
+            prediction = sentiment_model.predict(padded)
+            class_idx = int(np.argmax(prediction))
+            confidence = float(np.max(prediction))
+            
+            if class_idx == 0:
+                label = "NEGATİF"
+                sentiment_scores.append(-1)
+            elif class_idx == 1:
+                label = "NÖTR"
+                sentiment_scores.append(0)
+            else:
+                label = "POZİTİF"
+                sentiment_scores.append(1)
+                
+            confidence_sum += confidence
+            
+            analyzed_news.append({
+                "title": title,
+                "sentiment": label,
+                "confidence": confidence
+            })
+            
+        avg_polarity = sum(sentiment_scores) / len(sentiment_scores)
+        avg_confidence = confidence_sum / len(sentiment_scores)
+        
+        if avg_polarity > 0.2:
+            overall_sentiment = "POZİTİF"
+        elif avg_polarity < -0.2:
+            overall_sentiment = "NEGATİF"
+        else:
+            overall_sentiment = "NÖTR"
+            
+        return {
+            "status": "success",
+            "overall_sentiment": overall_sentiment,
+            "overall_confidence": avg_confidence,
+            "news": analyzed_news
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": f"Sistem Hatası: {str(e)}"}
